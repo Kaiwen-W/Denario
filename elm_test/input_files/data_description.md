@@ -1,0 +1,1 @@
+Toy test: analyze a small CSV of x,y points.

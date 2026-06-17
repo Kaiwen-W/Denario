@@ -1,9 +1,50 @@
 import os
 import re
+import json
+import functools
 from pathlib import Path
 import warnings
 
 from .llm import LLM, models
+
+
+@functools.lru_cache(maxsize=1)
+def _model_overrides() -> dict:
+    """Optional model-id remap, read from the DENARIO_MODEL_OVERRIDES env var (JSON).
+
+    Lets a custom/OpenAI-compatible endpoint receive model names it accepts (e.g.
+    map the dated default ids to bare ones) without editing source. Example:
+    DENARIO_MODEL_OVERRIDES='{"gpt-4o-2024-11-20": "gpt-4o"}'
+    """
+    raw = os.getenv("DENARIO_MODEL_OVERRIDES")
+    return json.loads(raw) if raw else {}
+
+
+def install_cmbagent_model_overrides() -> None:
+    """Apply DENARIO_MODEL_OVERRIDES to cmbagent's internal agents too.
+
+    cmbagent builds every agent config via its own ``get_model_config`` and some
+    agents (e.g. ``camb_context``, ``plot_judge``) use cmbagent's dated default
+    ids that never pass through ``llm_parser``. Wrapping ``get_model_config``
+    remaps those as well, so a custom endpoint receives the names it accepts.
+    No-op when DENARIO_MODEL_OVERRIDES is unset. Safe to call more than once.
+    """
+    try:
+        import cmbagent.cmbagent as _cc  # patch the bound name cmbagent actually calls
+    except Exception:
+        return
+    orig = getattr(_cc, "get_model_config", None)
+    if orig is None or getattr(orig, "_denario_wrapped", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapped(model, api_keys):
+        cfg = orig(model, api_keys)  # api_type inferred from the original name -> stays correct
+        cfg["model"] = _model_overrides().get(cfg["model"], cfg["model"])
+        return cfg
+
+    wrapped._denario_wrapped = True
+    _cc.get_model_config = wrapped
 
 def input_check(str_input: str) -> str:
     """Check if the input is a string with the desired content or the path markdown file, in which case reads it to get the content."""
@@ -25,6 +66,9 @@ def llm_parser(llm: LLM | str) -> LLM:
             llm = models[llm]
         except KeyError:
             raise KeyError(f"LLM '{llm}' not available. Please select from: {list(models.keys())}")
+    new_name = _model_overrides().get(llm.name, llm.name)
+    if new_name != llm.name:
+        llm = llm.model_copy(update={"name": new_name})  # don't mutate the shared singleton
     return llm
 
 def extract_file_paths(markdown_text):
